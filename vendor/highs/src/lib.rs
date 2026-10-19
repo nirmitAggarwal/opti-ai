@@ -1,0 +1,1623 @@
+#![forbid(missing_docs)]
+//! Safe rust binding to the [HiGHS](https://highs.dev) linear programming solver.
+//!
+//! ## Usage example
+//!
+//! ### Building a problem constraint by constraint with [RowProblem]
+//!
+//! Useful for traditional problem modelling where you first declare your variables, then add
+//!constraints one by one.
+//!
+//! ```
+//! use highs::{Sense, Model, HighsModelStatus, RowProblem};
+//! // max: x + 2y + z
+//! // under constraints:
+//! // c1: 3x +  y      <= 6
+//! // c2:       y + 2z <= 7
+//! let mut pb = RowProblem::default();
+//! // Create a variable named x, with a coefficient of 1 in the objective function,
+//! // that is bound between 0 and +∞.
+//! let x = pb.add_column(1., 0..);
+//! let y = pb.add_column(2., 0..);
+//! let z = pb.add_column(1., 0..);
+//! // constraint c1: x*3 + y*1 is bound to ]-∞; 6]
+//! pb.add_row(..=6, &[(x, 3.), (y, 1.)]);
+//! // constraint c2: y*1 +  z*2 is bound to ]-∞; 7]
+//! pb.add_row(..=7, &[(y, 1.), (z, 2.)]);
+//!
+//! let solved = pb.optimise(Sense::Maximise).solve();
+//!
+//! assert_eq!(solved.status(), HighsModelStatus::Optimal);
+//!
+//! let solution = solved.get_solution();
+//! // The expected solution is x=0  y=6  z=0.5
+//! assert_eq!(solution.columns(), vec![0., 6., 0.5]);
+//! // All the constraints are at their maximum
+//! assert_eq!(solution.rows(), vec![6., 7.]);
+//! ```
+//!
+//! ### Building a problem variable by variable with [ColProblem]
+//!
+//! Useful for resource allocation problems and other problems when you know in advance the number
+//! of constraints and their bounds, but dynamically add new variables to the problem.
+//!
+//! This is slightly more efficient than building the problem constraint by constraint.
+//!
+//! ```
+//! use highs::{ColProblem, Sense};
+//! let mut pb = ColProblem::new();
+//! // We cannot use more then 5 units of sugar in total.
+//! let sugar = pb.add_row(..=5);
+//! // We cannot use more then 3 units of milk in total.
+//! let milk = pb.add_row(..=3);
+//! // We have a first cake that we can sell for 2€. Baking it requires 1 unit of milk and 2 of sugar.
+//! pb.add_integer_column(2., 0.., &[(sugar, 2.), (milk, 1.)]);
+//! // We have a second cake that we can sell for 8€. Baking it requires 2 units of milk and 3 of sugar.
+//! pb.add_integer_column(8., 0.., &[(sugar, 3.), (milk, 2.)]);
+//! // Find the maximal possible profit
+//! let solution = pb.optimise(Sense::Maximise).solve().get_solution();
+//! // The solution is to bake 1 cake of each sort
+//! assert_eq!(solution.columns(), vec![1., 1.]);
+//! ```
+//!
+//! ```
+//! use highs::{Sense, Model, HighsModelStatus, ColProblem};
+//! // max: x + 2y + z
+//! // under constraints:
+//! // c1: 3x +  y      <= 6
+//! // c2:       y + 2z <= 7
+//! let mut pb = ColProblem::default();
+//! let c1 = pb.add_row(..6.);
+//! let c2 = pb.add_row(..7.);
+//! // x
+//! pb.add_column(1., 0.., &[(c1, 3.)]);
+//! // y
+//! pb.add_column(2., 0.., &[(c1, 1.), (c2, 1.)]);
+//! // z
+//! pb.add_column(1., 0.., vec![(c2, 2.)]);
+//!
+//! let solved = pb.optimise(Sense::Maximise).solve();
+//!
+//! assert_eq!(solved.status(), HighsModelStatus::Optimal);
+//!
+//! let solution = solved.get_solution();
+//! // The expected solution is x=0  y=6  z=0.5
+//! assert_eq!(solution.columns(), vec![0., 6., 0.5]);
+//! // All the constraints are at their maximum
+//! assert_eq!(solution.rows(), vec![6., 7.]);
+//! ```
+//!
+//! ### Integer variables
+//!
+//! HiGHS supports mixed integer-linear programming.
+//! You can use `add_integer_column` to add an integer variable to the problem,
+//! and the solution is then guaranteed to contain a whole number as a value for this variable.
+//!
+//! ```
+//! use highs::{Sense, Model, HighsModelStatus, ColProblem};
+//! // maximize: x + 2y under constraints x + y <= 3.5 and x - y >= 1
+//! let mut pb = ColProblem::default();
+//! let c1 = pb.add_row(..3.5);
+//! let c2 = pb.add_row(1..);
+//! // x (continuous variable)
+//! pb.add_column(1., 0.., &[(c1, 1.), (c2, 1.)]);
+//! // y (integer variable)
+//! pb.add_integer_column(2., 0.., &[(c1, 1.), (c2, -1.)]);
+//! let solved = pb.optimise(Sense::Maximise).solve();
+//! // The expected solution is x=2.5  y=1
+//! assert_eq!(solved.get_solution().columns(), vec![2.5, 1.]);
+//! ```
+
+use std::convert::{TryFrom, TryInto};
+use std::ffi::{c_void, CStr, CString};
+use std::num::{NonZeroU32, TryFromIntError};
+use std::ops::{Bound, Index, RangeBounds};
+use std::os::raw::c_int;
+use std::ptr::null;
+
+use highs_sys::*;
+
+pub use matrix_col::{ColMatrix, Row};
+pub use matrix_row::{Col, RowMatrix};
+pub use options::{HighsOptionValue, TrySetOptionError};
+pub use status::{HighsModelStatus, HighsSolutionStatus, HighsStatus};
+
+/// A problem where variables are declared first, and constraints are then added dynamically.
+/// See [`Problem<RowMatrix>`](Problem#impl-1).
+pub type RowProblem = Problem<RowMatrix>;
+/// A problem where constraints are declared first, and variables are then added dynamically.
+/// See [`Problem<ColMatrix>`](Problem#impl).
+pub type ColProblem = Problem<ColMatrix>;
+
+mod matrix_col;
+mod matrix_row;
+mod options;
+mod status;
+
+/// A complete optimization problem.
+/// Depending on the `MATRIX` type parameter, the problem will be built
+/// constraint by constraint (with [ColProblem]), or
+/// variable by variable (with [RowProblem])
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Problem<MATRIX = ColMatrix> {
+    // columns
+    colcost: Vec<f64>,
+    collower: Vec<f64>,
+    colupper: Vec<f64>,
+    // rows
+    rowlower: Vec<f64>,
+    rowupper: Vec<f64>,
+    integrality: Option<Vec<HighsInt>>,
+    matrix: MATRIX,
+}
+
+impl<MATRIX: Default> Problem<MATRIX>
+where
+    Problem<ColMatrix>: From<Problem<MATRIX>>,
+{
+    /// Number of variables in the problem
+    pub fn num_cols(&self) -> usize {
+        self.colcost.len()
+    }
+
+    /// Number of constraints in the problem
+    pub fn num_rows(&self) -> usize {
+        self.rowlower.len()
+    }
+
+    fn add_row_inner<N: Into<f64> + Copy, B: RangeBounds<N>>(&mut self, bounds: B) -> Row {
+        let r = Row(self.num_rows().try_into().expect("too many rows"));
+        let low = bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY);
+        let high = bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY);
+        self.rowlower.push(low);
+        self.rowupper.push(high);
+        r
+    }
+
+    fn add_column_inner<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        integrality: Integrality,
+    ) {
+        let raw = integrality.as_raw();
+        // Only allocate the integrality vector once a non-continuous column
+        // appears. A pure-LP problem keeps it `None` and uses `Highs_passLp`.
+        if raw != VAR_TYPE_CONTINUOUS && self.integrality.is_none() {
+            self.integrality = Some(vec![VAR_TYPE_CONTINUOUS; self.num_cols()]);
+        }
+        if let Some(existing) = &mut self.integrality {
+            existing.push(raw);
+        }
+        self.colcost.push(col_factor);
+        let low = bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY);
+        let high = bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY);
+        self.collower.push(low);
+        self.colupper.push(high);
+    }
+
+    /// Create a model based on this problem. Don't solve it yet.
+    /// If the problem is a [RowProblem], it will have to be converted to a [ColProblem] first,
+    /// which takes an amount of time proportional to the size of the problem.
+    /// If the problem is invalid (according to HiGHS), this function will panic.
+    pub fn optimise(self, sense: Sense) -> Model {
+        self.try_optimise(sense).expect("invalid problem")
+    }
+
+    /// Create a model based on this problem. Don't solve it yet.
+    /// If the problem is a [RowProblem], it will have to be converted to a [ColProblem] first,
+    /// which takes an amount of time proportional to the size of the problem.
+    pub fn try_optimise(self, sense: Sense) -> Result<Model, HighsStatus> {
+        let mut m = Model::try_new(self)?;
+        m.set_sense(sense);
+        Ok(m)
+    }
+
+    /// Create a new problem instance
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Updates the cost of a column
+    pub fn change_column_cost(&mut self, col: Col, cost: f64) {
+        self.colcost[col.index()] = cost
+    }
+
+    /// Updates the bounds of a column
+    pub fn change_column_bounds<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col: Col,
+        bounds: B,
+    ) {
+        let low = bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY);
+        let high = bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY);
+        self.collower[col.index()] = low;
+        self.colupper[col.index()] = high;
+    }
+}
+
+fn bound_value<N: Into<f64> + Copy>(b: Bound<&N>) -> Option<f64> {
+    match b {
+        Bound::Included(v) | Bound::Excluded(v) => Some((*v).into()),
+        Bound::Unbounded => None,
+    }
+}
+
+fn c(n: usize) -> HighsInt {
+    n.try_into().expect("size too large for HiGHS")
+}
+
+macro_rules! highs_call {
+    ($function_name:ident ($($param:expr),+)) => {
+        try_handle_status(
+            $function_name($($param),+),
+            stringify!($function_name)
+        )
+    }
+}
+
+/// A model to solve
+#[derive(Debug)]
+pub struct Model {
+    highs: HighsPtr,
+}
+
+/// A solved model
+#[derive(Debug)]
+pub struct SolvedModel {
+    highs: HighsPtr,
+}
+
+/// The kind of values a variable (column) may take.
+///
+/// For [`SemiContinuous`](Integrality::SemiContinuous) and
+/// [`SemiInteger`](Integrality::SemiInteger) variables, the value is either `0`
+/// or lies within the column's `[lower, upper]` bounds.
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Default)]
+pub enum Integrality {
+    /// Any real value within the column bounds.
+    #[default]
+    Continuous,
+    /// Any integer value within the column bounds.
+    Integer,
+    /// Either `0` or any real value within the column bounds.
+    SemiContinuous,
+    /// Either `0` or any integer value within the column bounds.
+    SemiInteger,
+}
+
+impl Integrality {
+    fn as_raw(self) -> HighsInt {
+        match self {
+            Integrality::Continuous => VAR_TYPE_CONTINUOUS,
+            Integrality::Integer => VAR_TYPE_INTEGER,
+            Integrality::SemiContinuous => VAR_TYPE_SEMI_CONTINUOUS,
+            Integrality::SemiInteger => VAR_TYPE_SEMI_INTEGER,
+        }
+    }
+}
+
+impl From<bool> for Integrality {
+    /// `true` maps to [`Integrality::Integer`] and `false` to
+    /// [`Integrality::Continuous`].
+    fn from(is_integer: bool) -> Self {
+        if is_integer {
+            Integrality::Integer
+        } else {
+            Integrality::Continuous
+        }
+    }
+}
+
+/// Whether to maximize or minimize the objective function
+#[repr(C)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Sense {
+    /// max
+    Maximise = OBJECTIVE_SENSE_MAXIMIZE as isize,
+    /// min
+    Minimise = OBJECTIVE_SENSE_MINIMIZE as isize,
+}
+
+/// Storage layout of a quadratic objective Hessian passed to
+/// [`Model::pass_hessian`].
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum HessianFormat {
+    /// Only the lower triangle of the symmetric Hessian is stored, in
+    /// compressed sparse column form. This is the usual way to give the
+    /// Hessian of `0.5 x' Q x`.
+    Triangular,
+    /// The full square Hessian is stored in compressed sparse column form.
+    Square,
+}
+
+impl HessianFormat {
+    fn as_raw(self) -> HighsInt {
+        match self {
+            HessianFormat::Triangular => kHighsHessianFormatTriangular,
+            HessianFormat::Square => kHighsHessianFormatSquare,
+        }
+    }
+}
+
+/// Reason a Hessian could not be uploaded by [`Model::try_pass_hessian`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HessianError {
+    /// The dimension of `Q` (its number of columns) does not fit in HiGHS'
+    /// integer type.
+    DimensionTooLarge {
+        /// The dimension that was requested.
+        dim: usize,
+    },
+    /// The number of stored nonzero coefficients does not fit in HiGHS'
+    /// integer type.
+    TooManyNonZeros {
+        /// The number of nonzeros that was requested.
+        nnz: usize,
+    },
+    /// A row index does not fit in HiGHS' integer type.
+    IndexTooLarge {
+        /// Position, among the stored coefficients, of the offending entry.
+        entry: usize,
+    },
+    /// HiGHS rejected the Hessian and returned this status.
+    Highs(HighsStatus),
+}
+
+impl std::fmt::Display for HessianError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let max = HighsInt::MAX;
+        match *self {
+            HessianError::DimensionTooLarge { dim } => write!(
+                f,
+                "the dimension of the quadratic objective matrix (Hessian Q) is too large: \
+                 got {dim} but HiGHS supports at most {max}"
+            ),
+            HessianError::TooManyNonZeros { nnz } => write!(
+                f,
+                "the Hessian Q has too many nonzero coefficients: \
+                 got {nnz} but HiGHS supports at most {max}"
+            ),
+            HessianError::IndexTooLarge { entry } => write!(
+                f,
+                "the row index of Hessian coefficient {entry} is too large \
+                 for HiGHS' integer type (at most {max})"
+            ),
+            HessianError::Highs(status) => write!(f, "HiGHS rejected the Hessian: {status:?}"),
+        }
+    }
+}
+
+impl std::error::Error for HessianError {}
+
+impl From<HighsStatus> for HessianError {
+    fn from(status: HighsStatus) -> Self {
+        HessianError::Highs(status)
+    }
+}
+
+impl Model {
+    /// Return pointer to underlying HiGHS model
+    pub fn as_ptr(&self) -> *const c_void {
+        self.highs.ptr()
+    }
+
+    /// Return mutable pointer to underlying HiGHS model
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.highs.mut_ptr()
+    }
+
+    /// Set the optimization sense (minimize by default)
+    pub fn set_sense(&mut self, sense: Sense) {
+        let ret = unsafe { Highs_changeObjectiveSense(self.highs.mut_ptr(), sense as c_int) };
+        assert_eq!(ret, STATUS_OK, "changeObjectiveSense failed");
+    }
+
+    /// Gets the number of columns in the model
+    pub fn num_cols(&self) -> usize {
+        self.highs.num_cols().expect("num cols does not fit usize")
+    }
+
+    /// Gets the number of rows in the model
+    pub fn num_rows(&self) -> usize {
+        self.highs.num_rows().expect("num rows does not fit usize")
+    }
+
+    /// Create a Highs model to be optimized (but don't solve it yet).
+    /// If the given problem is a [RowProblem], it will have to be converted to a [ColProblem] first,
+    /// which takes an amount of time proportional to the size of the problem.
+    /// Panics if the problem is incoherent
+    pub fn new<P: Into<Problem<ColMatrix>>>(problem: P) -> Self {
+        Self::try_new(problem).expect("incoherent problem")
+    }
+
+    /// Create a Highs model to be optimized (but don't solve it yet).
+    /// If the given problem is a [RowProblem], it will have to be converted to a [ColProblem] first,
+    /// which takes an amount of time proportional to the size of the problem.
+    /// Returns an error if the problem is incoherent
+    pub fn try_new<P: Into<Problem<ColMatrix>>>(problem: P) -> Result<Self, HighsStatus> {
+        let mut highs = HighsPtr::default();
+        highs.make_quiet();
+        let problem = problem.into();
+        log::debug!(
+            "Adding a problem with {} variables and {} constraints to HiGHS",
+            problem.num_cols(),
+            problem.num_rows()
+        );
+        let offset = 0.0;
+        unsafe {
+            if let Some(integrality) = &problem.integrality {
+                highs_call!(Highs_passMip(
+                    highs.mut_ptr(),
+                    c(problem.num_cols()),
+                    c(problem.num_rows()),
+                    c(problem.matrix.avalue.len()),
+                    MATRIX_FORMAT_COLUMN_WISE,
+                    OBJECTIVE_SENSE_MINIMIZE,
+                    offset,
+                    problem.colcost.as_ptr(),
+                    problem.collower.as_ptr(),
+                    problem.colupper.as_ptr(),
+                    problem.rowlower.as_ptr(),
+                    problem.rowupper.as_ptr(),
+                    problem.matrix.astart.as_ptr(),
+                    problem.matrix.aindex.as_ptr(),
+                    problem.matrix.avalue.as_ptr(),
+                    integrality.as_ptr()
+                ))
+            } else {
+                highs_call!(Highs_passLp(
+                    highs.mut_ptr(),
+                    c(problem.num_cols()),
+                    c(problem.num_rows()),
+                    c(problem.matrix.avalue.len()),
+                    MATRIX_FORMAT_COLUMN_WISE,
+                    OBJECTIVE_SENSE_MINIMIZE,
+                    offset,
+                    problem.colcost.as_ptr(),
+                    problem.collower.as_ptr(),
+                    problem.colupper.as_ptr(),
+                    problem.rowlower.as_ptr(),
+                    problem.rowupper.as_ptr(),
+                    problem.matrix.astart.as_ptr(),
+                    problem.matrix.aindex.as_ptr(),
+                    problem.matrix.avalue.as_ptr()
+                ))
+            }
+            .map(|_| Self { highs })
+        }
+    }
+
+    /// Prevents writing anything to the standard output or to files when solving the model
+    pub fn make_quiet(&mut self) {
+        self.highs.make_quiet()
+    }
+
+    /// Set a custom parameter on the model.
+    /// For the list of available options and their documentation, see:
+    /// <https://ergo-code.github.io/HiGHS/dev/options/definitions/>
+    ///
+    /// ```
+    /// # use highs::ColProblem;
+    /// # use highs::Sense::Maximise;
+    /// let mut model = ColProblem::default().optimise(Maximise);
+    /// model.set_option("presolve", "off"); // disable the presolver
+    /// model.set_option("solver", "ipm"); // use the ipm solver
+    /// model.set_option("time_limit", 30.0); // stop after 30 seconds
+    /// model.set_option("parallel", "on"); // use multiple cores
+    /// model.set_option("threads", 4); // solve on 4 threads
+    /// ```
+    pub fn set_option<STR: Into<Vec<u8>>, V: HighsOptionValue>(&mut self, option: STR, value: V) {
+        self.try_set_option(option, value).unwrap()
+    }
+
+    /// Try to set a custom parameter on the model, returning an error if it fails.
+    /// For the list of available options and their documentation, see:
+    /// <https://ergo-code.github.io/HiGHS/dev/options/definitions/>
+    ///
+    /// It will fail if the option does not exist or the value is invalid.
+    ///
+    /// ```
+    /// # use highs::ColProblem;
+    /// # use highs::Sense::Maximise;
+    /// let mut model = ColProblem::default().optimise(Maximise);
+    /// assert!(model.try_set_option("presolve", "off").is_ok()); // disable the presolver
+    /// assert!(model.try_set_option("made_up_option", true).is_err());
+    /// ```
+    pub fn try_set_option<STR: Into<Vec<u8>>, V: HighsOptionValue>(
+        &mut self,
+        option: STR,
+        value: V,
+    ) -> Result<(), TrySetOptionError> {
+        self.highs.try_set_option(option, value)
+    }
+
+    /// Set the number of threads to use when solving the model.
+    ///
+    /// ```
+    /// # use highs::ColProblem;
+    /// # use highs::Sense::Maximise;
+    /// # use std::num::NonZeroU32;
+    /// let mut model = ColProblem::default().optimise(Maximise);
+    /// model.set_threads(NonZeroU32::new(1).unwrap());
+    /// ```
+    pub fn set_threads(&mut self, threads: NonZeroU32) {
+        self.set_option("threads", threads.get() as i32);
+    }
+
+    /// Find the optimal value for the problem, panic if the problem is incoherent
+    pub fn solve(self) -> SolvedModel {
+        self.try_solve().expect("HiGHS error: invalid problem")
+    }
+
+    /// Find the optimal value for the problem, return an error if the problem is incoherent
+    pub fn try_solve(mut self) -> Result<SolvedModel, HighsStatus> {
+        unsafe { highs_call!(Highs_run(self.highs.mut_ptr())) }
+            .map(|_| SolvedModel { highs: self.highs })
+    }
+
+    /// Adds a new constraint to the highs model.
+    ///
+    /// Returns the added row index.
+    ///
+    /// # Panics
+    ///
+    /// If HIGHS returns an error status value.
+    pub fn add_row<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Col, f64)>,
+    ) -> Row {
+        self.try_add_row(bounds, row_factors)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Tries to add a new constraint to the highs model.
+    ///
+    /// Returns the added row index, or the error status value if HIGHS returned an error status.
+    pub fn try_add_row<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Col, f64)>,
+    ) -> Result<Row, HighsStatus> {
+        let (cols, factors): (Vec<_>, Vec<_>) = row_factors.into_iter().unzip();
+
+        unsafe {
+            highs_call!(Highs_addRow(
+                self.highs.mut_ptr(),
+                bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY),
+                bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY),
+                cols.len().try_into().unwrap(),
+                cols.into_iter()
+                    .map(|c| c.0.try_into().unwrap())
+                    .collect::<Vec<_>>()
+                    .as_ptr(),
+                factors.as_ptr()
+            ))
+        }?;
+
+        Ok(Row((self.highs.num_rows()? - 1) as c_int))
+    }
+
+    /// Adds a new variable to the highs model.
+    ///
+    /// Returns the added column index.
+    ///
+    /// # Panics
+    ///
+    /// If HIGHS returns an error status value.
+    pub fn add_col<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Col {
+        self.try_add_column_with_integrality(col_factor, bounds, row_factors, false)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Tries to add a new variable to the highs model.
+    ///
+    /// Returns the added column index, or the error status value if HIGHS returned an error status.
+    pub fn try_add_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Result<Col, HighsStatus> {
+        self.try_add_column_with_integrality(col_factor, bounds, row_factors, false)
+    }
+
+    /// Same as [`Model::add_column`], but adds an _integer_ column
+    pub fn add_integer_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Col {
+        self.try_add_column_with_integrality(col_factor, bounds, row_factors, true)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Same as [`Model::add_column`], but adds an _integer_ column
+    pub fn try_add_integer_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Result<Col, HighsStatus> {
+        self.try_add_column_with_integrality(col_factor, bounds, row_factors, true)
+    }
+
+    /// Same as [`Model::add_column`], but lets you define whether the new variable should be
+    /// integral or continuous.
+    #[inline]
+    pub fn add_column_with_integrality<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+        is_integer: bool,
+    ) -> Col {
+        self.try_add_column_with_integrality(col_factor, bounds, row_factors, is_integer)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Same as [`Model::try_add_column`] but lets you define whether the new variable should be
+    /// integral or continuous.
+    pub fn try_add_column_with_integrality<N, B>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+        is_integer: bool,
+    ) -> Result<Col, HighsStatus>
+    where
+        N: Into<f64> + Copy,
+        B: RangeBounds<N>,
+    {
+        self.try_add_column_with_integrality_kind(
+            col_factor,
+            bounds,
+            row_factors,
+            is_integer.into(),
+        )
+    }
+
+    /// Same as [`Model::try_add_column`] but lets you set the column's
+    /// [`Integrality`] (continuous, integer, semicontinuous, or semi-integer).
+    pub fn try_add_column_with_integrality_kind<N, B>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+        integrality: Integrality,
+    ) -> Result<Col, HighsStatus>
+    where
+        N: Into<f64> + Copy,
+        B: RangeBounds<N>,
+    {
+        let (rows, factors): (Vec<_>, Vec<_>) = row_factors.into_iter().unzip();
+        unsafe {
+            highs_call!(Highs_addCol(
+                self.highs.mut_ptr(),
+                col_factor,
+                bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY),
+                bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY),
+                rows.len().try_into().unwrap(),
+                rows.into_iter().map(|r| r.0).collect::<Vec<_>>().as_ptr(),
+                factors.as_ptr()
+            ))?;
+        }
+        let raw = integrality.as_raw();
+        if raw != VAR_TYPE_CONTINUOUS {
+            unsafe {
+                highs_call!(Highs_changeColIntegrality(
+                    self.highs.mut_ptr(),
+                    (self.highs.num_cols()? - 1).try_into().unwrap(),
+                    raw
+                ))?;
+            }
+        }
+
+        Ok(Col(self.highs.num_cols()? - 1))
+    }
+
+    /// Same as [`Model::add_column`] but lets you set the column's
+    /// [`Integrality`] (continuous, integer, semicontinuous, or semi-integer).
+    ///
+    /// # Panics
+    ///
+    /// If HiGHS returns an error status value.
+    #[inline]
+    pub fn add_column_with_integrality_kind<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+        integrality: Integrality,
+    ) -> Col {
+        self.try_add_column_with_integrality_kind(col_factor, bounds, row_factors, integrality)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Add a semicontinuous variable: its value is `0` or within `bounds`.
+    ///
+    /// # Panics
+    ///
+    /// If HiGHS returns an error status value.
+    pub fn add_semi_continuous_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Col {
+        self.try_add_semi_continuous_column(col_factor, bounds, row_factors)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Add a semicontinuous variable: its value is `0` or within `bounds`.
+    pub fn try_add_semi_continuous_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Result<Col, HighsStatus> {
+        self.try_add_column_with_integrality_kind(
+            col_factor,
+            bounds,
+            row_factors,
+            Integrality::SemiContinuous,
+        )
+    }
+
+    /// Add a semi-integer variable: its value is `0` or an integer within `bounds`.
+    ///
+    /// # Panics
+    ///
+    /// If HiGHS returns an error status value.
+    pub fn add_semi_integer_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Col {
+        self.try_add_semi_integer_column(col_factor, bounds, row_factors)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Add a semi-integer variable: its value is `0` or an integer within `bounds`.
+    pub fn try_add_semi_integer_column<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col_factor: f64,
+        bounds: B,
+        row_factors: impl IntoIterator<Item = (Row, f64)>,
+    ) -> Result<Col, HighsStatus> {
+        self.try_add_column_with_integrality_kind(
+            col_factor,
+            bounds,
+            row_factors,
+            Integrality::SemiInteger,
+        )
+    }
+
+    /// Updates the cost of a column
+    pub fn change_column_cost(&mut self, col: Col, cost: f64) {
+        unsafe {
+            highs_call!(Highs_changeColCost(
+                self.highs.mut_ptr(),
+                col.index() as c_int,
+                cost
+            ))
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"));
+        }
+    }
+
+    /// Updates the bounds of a column
+    pub fn change_column_bounds<N: Into<f64> + Copy, B: RangeBounds<N>>(
+        &mut self,
+        col: Col,
+        bounds: B,
+    ) {
+        let low = bound_value(bounds.start_bound()).unwrap_or(f64::NEG_INFINITY);
+        let high = bound_value(bounds.end_bound()).unwrap_or(f64::INFINITY);
+        unsafe {
+            highs_call!(Highs_changeColBounds(
+                self.highs.mut_ptr(),
+                col.index() as c_int,
+                low,
+                high
+            ))
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"));
+        }
+    }
+
+    /// Hot-starts at the initial guess. See HIGHS documentation for further details.
+    ///
+    /// # Panics
+    ///
+    /// If HIGHS returns an error status value.
+    ///
+    /// If the data passed in do not have the correct lengths.
+    /// `cols` and `col_duals` should have the lengths of `num_cols`.
+    /// `rows` and `row_duals` should have the lengths of `num_rows`.
+    pub fn set_solution(
+        &mut self,
+        cols: Option<&[f64]>,
+        rows: Option<&[f64]>,
+        col_duals: Option<&[f64]>,
+        row_duals: Option<&[f64]>,
+    ) {
+        self.try_set_solution(cols, rows, col_duals, row_duals)
+            .unwrap_or_else(|e| panic!("HiGHS error: {e:?}"))
+    }
+
+    /// Tries to hot-start using an initial guess by passing the column and row primal and dual solution values.
+    /// See highs_c_api.h for further details.
+    ///
+    /// If the data passed in do not have the correct lengths, an `Err` is returned.
+    /// `cols` and `col_duals` should have the lengths of `num_cols`.
+    /// `rows` and `row_duals` should have the lengths of `num_rows`.
+    pub fn try_set_solution(
+        &mut self,
+        cols: Option<&[f64]>,
+        rows: Option<&[f64]>,
+        col_duals: Option<&[f64]>,
+        row_duals: Option<&[f64]>,
+    ) -> Result<(), HighsStatus> {
+        let num_cols = self.highs.num_cols()?;
+        let num_rows = self.highs.num_rows()?;
+        if let Some(cols) = cols {
+            if cols.len() != num_cols {
+                return Err(HighsStatus::Error);
+            }
+        }
+        if let Some(rows) = rows {
+            if rows.len() != num_rows {
+                return Err(HighsStatus::Error);
+            }
+        }
+        if let Some(col_duals) = col_duals {
+            if col_duals.len() != num_cols {
+                return Err(HighsStatus::Error);
+            }
+        }
+        if let Some(row_duals) = row_duals {
+            if row_duals.len() != num_rows {
+                return Err(HighsStatus::Error);
+            }
+        }
+        unsafe {
+            highs_call!(Highs_setSolution(
+                self.highs.mut_ptr(),
+                cols.map(|x| { x.as_ptr() }).unwrap_or(null()),
+                rows.map(|x| { x.as_ptr() }).unwrap_or(null()),
+                col_duals.map(|x| { x.as_ptr() }).unwrap_or(null()),
+                row_duals.map(|x| { x.as_ptr() }).unwrap_or(null())
+            ))
+        }?;
+        Ok(())
+    }
+
+    /// Upload a quadratic objective Hessian `Q`, turning the model into a QP
+    /// with objective `c'x + 0.5 x' Q x` (where `c` is the linear objective
+    /// already set on the columns).
+    ///
+    /// `Q` is provided column by column: `columns` yields one item per column
+    /// of `Q` and each column yields its stored `(row index, coefficient)` pairs.
+    /// For [`HessianFormat::Triangular`] store only the lower triangle.
+    /// For [`HessianFormat::Square`] store the full matrix.
+    /// Both levels can be anything iterable and the indices may be any integer type
+    /// that converts to HiGHS' integer type.
+    ///
+    /// HiGHS solves **convex** QPs only: `Q` should be positive semidefinite.
+    /// HiGHS does not check this:
+    /// on an indefinite `Q` it may return a wrong or
+    /// non-optimal solution.
+    /// HiGHS, however, does test for negative diagonal values.
+    /// Verify convexity yourself if `Q` is not PSD by construction.
+    ///
+    /// # Panics
+    ///
+    /// If HiGHS returns an error status value, or an index/size does not fit in
+    /// HiGHS' integer type. Use [`Model::try_pass_hessian`] to handle these as
+    /// a [`HessianError`] instead.
+    pub fn pass_hessian<C, E, I>(&mut self, format: HessianFormat, columns: C)
+    where
+        C: IntoIterator<Item = E>,
+        E: IntoIterator<Item = (I, f64)>,
+        I: TryInto<HighsInt>,
+    {
+        self.try_pass_hessian(format, columns)
+            .unwrap_or_else(|e| panic!("pass_hessian failed: {e}"))
+    }
+
+    /// Same as [`Model::pass_hessian`], but returns a [`HessianError`] instead
+    /// of panicking. An empty Hessian (no coefficients) is a no-op and leaves
+    /// the model linear.
+    ///
+    /// ```
+    /// use highs::{RowProblem, Sense, HessianFormat, HighsModelStatus};
+    /// // min x^2 + y^2  s.t.  x + y = 1,  x, y in [-10, 10]
+    /// let mut pb = RowProblem::new();
+    /// let x = pb.add_column(0.0, -10.0..=10.0);
+    /// let y = pb.add_column(0.0, -10.0..=10.0);
+    /// pb.add_row(1.0..=1.0, [(x, 1.0), (y, 1.0)]);
+    /// let mut model = pb.optimise(Sense::Minimise);
+    /// // Q = diag(2, 2): one column per variable, each with its diagonal entry.
+    /// model
+    ///     .try_pass_hessian(HessianFormat::Triangular, [[(0, 2.0)], [(1, 2.0)]])
+    ///     .unwrap();
+    /// let solved = model.solve();
+    /// assert_eq!(solved.status(), HighsModelStatus::Optimal);
+    /// let cols = solved.get_solution().columns().to_vec();
+    /// assert!((cols[0] - 0.5).abs() < 1e-6);
+    /// assert!((cols[1] - 0.5).abs() < 1e-6);
+    /// ```
+    pub fn try_pass_hessian<C, E, I>(
+        &mut self,
+        format: HessianFormat,
+        columns: C,
+    ) -> Result<(), HessianError>
+    where
+        C: IntoIterator<Item = E>,
+        E: IntoIterator<Item = (I, f64)>,
+        I: TryInto<HighsInt>,
+    {
+        // Build the compressed-sparse-column arrays from the per-column
+        // iterators.
+        let mut start: Vec<HighsInt> = Vec::new();
+        let mut index: Vec<HighsInt> = Vec::new();
+        let mut value: Vec<f64> = Vec::new();
+        for column in columns {
+            let offset = index.len();
+            start.push(
+                offset
+                    .try_into()
+                    .map_err(|_| HessianError::TooManyNonZeros { nnz: offset })?,
+            );
+            for (i, v) in column {
+                let i: HighsInt = i
+                    .try_into()
+                    .map_err(|_| HessianError::IndexTooLarge { entry: index.len() })?;
+                index.push(i);
+                value.push(v);
+            }
+        }
+        if value.is_empty() {
+            return Ok(());
+        }
+        let dim: HighsInt = start
+            .len()
+            .try_into()
+            .map_err(|_| HessianError::DimensionTooLarge { dim: start.len() })?;
+        let nnz: HighsInt = value
+            .len()
+            .try_into()
+            .map_err(|_| HessianError::TooManyNonZeros { nnz: value.len() })?;
+        unsafe {
+            highs_call!(Highs_passHessian(
+                self.highs.mut_ptr(),
+                dim,
+                nnz,
+                format.as_raw(),
+                start.as_ptr(),
+                index.as_ptr(),
+                value.as_ptr()
+            ))
+        }
+        .map(|_| ())
+        .map_err(HessianError::from)
+    }
+}
+
+impl From<SolvedModel> for Model {
+    fn from(solved: SolvedModel) -> Self {
+        Self {
+            highs: solved.highs,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HighsPtr(*mut c_void);
+
+impl Drop for HighsPtr {
+    fn drop(&mut self) {
+        unsafe { Highs_destroy(self.0) }
+    }
+}
+
+impl Default for HighsPtr {
+    fn default() -> Self {
+        Self(unsafe { Highs_create() })
+    }
+}
+
+impl HighsPtr {
+    // To be used instead of unsafe_mut_ptr wherever possible
+    #[allow(dead_code)]
+    const fn ptr(&self) -> *const c_void {
+        self.0
+    }
+
+    // Needed until https://github.com/ERGO-Code/HiGHS/issues/479 is fixed
+    unsafe fn unsafe_mut_ptr(&self) -> *mut c_void {
+        self.0
+    }
+
+    fn mut_ptr(&mut self) -> *mut c_void {
+        self.0
+    }
+
+    /// Prevents writing anything to the standard output when solving the model
+    pub fn make_quiet(&mut self) {
+        // setting log_file seems to cause a double free in Highs.
+        // See https://github.com/rust-or/highs/issues/3
+        // self.set_option(&b"log_file"[..], "");
+        self.try_set_option(&b"output_flag"[..], false).unwrap();
+        self.try_set_option(&b"log_to_console"[..], false).unwrap();
+    }
+
+    /// Set a custom parameter on the model
+    pub fn try_set_option<STR: Into<Vec<u8>>, V: HighsOptionValue>(
+        &mut self,
+        option: STR,
+        value: V,
+    ) -> Result<(), TrySetOptionError> {
+        let c_str = CString::new(option).map_err(|_| TrySetOptionError {})?;
+        let status = unsafe { value.apply_to_highs(self.mut_ptr(), c_str.as_ptr()) };
+        match try_handle_status(status, "Highs_setOptionValue") {
+            Ok(_) => Ok(()),
+            Err(_) => Err(TrySetOptionError {}),
+        }
+    }
+
+    /// Number of variables
+    fn num_cols(&self) -> Result<usize, TryFromIntError> {
+        let n = unsafe { Highs_getNumCols(self.0) };
+        n.try_into()
+    }
+
+    /// Number of constraints
+    fn num_rows(&self) -> Result<usize, TryFromIntError> {
+        let n = unsafe { Highs_getNumRows(self.0) };
+        n.try_into()
+    }
+}
+
+impl SolvedModel {
+    /// Return pointer to underlying HiGHS model
+    pub fn as_ptr(&self) -> *const c_void {
+        self.highs.ptr()
+    }
+
+    /// Return mutable pointer to underlying HiGHS model
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.highs.mut_ptr()
+    }
+
+    /// Get the objective value for the solution.
+    ///
+    /// If an error occurs (e.g. the model is infeasible) then the returned value may be zero.
+    pub fn objective_value(&self) -> f64 {
+        unsafe { highs_sys::Highs_getObjectiveValue(self.as_ptr()) }
+    }
+
+    /// The model status of the solution. Should be Optimal if everything went well.
+    pub fn status(&self) -> HighsModelStatus {
+        let model_status = unsafe { Highs_getModelStatus(self.highs.unsafe_mut_ptr()) };
+        HighsModelStatus::try_from(model_status).unwrap()
+    }
+
+    /// The mip gap of the solution. Should be 0.0 if an optimal solution was
+    /// found. Will be INFINITY if no variables have an integer constraint.
+    pub fn mip_gap(&self) -> f64 {
+        self.double_info_value(c"mip_gap")
+            .expect("mip_gap is a known double info key")
+    }
+
+    /// The primal solution status, reflecting if a solution was found or not.
+    pub fn primal_solution_status(&self) -> HighsSolutionStatus {
+        let value = self
+            .int_info_value(c"primal_solution_status")
+            .expect("primal_solution_status is a known HighsInt info key");
+        HighsSolutionStatus::try_from(value as HighsInt)
+            .expect("HiGHS returned an unrecognized primal solution status")
+    }
+
+    /// Get the solution to the problem
+    pub fn get_solution(&self) -> Solution {
+        let cols = self.num_cols();
+        let rows = self.num_rows();
+        let mut colvalue: Vec<f64> = vec![0.; cols];
+        let mut coldual: Vec<f64> = vec![0.; cols];
+        let mut rowvalue: Vec<f64> = vec![0.; rows];
+        let mut rowdual: Vec<f64> = vec![0.; rows];
+
+        // Get the primal and dual solution
+        unsafe {
+            Highs_getSolution(
+                self.highs.unsafe_mut_ptr(),
+                colvalue.as_mut_ptr(),
+                coldual.as_mut_ptr(),
+                rowvalue.as_mut_ptr(),
+                rowdual.as_mut_ptr(),
+            );
+        }
+
+        Solution {
+            colvalue,
+            coldual,
+            rowvalue,
+            rowdual,
+        }
+    }
+
+    /// Read a `HighsInt`-typed solution info value by name and widen it to
+    /// `i64`.
+    ///
+    /// `name` must be a key that HiGHS exposes as a `HighsInt`-typed info value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failing [`HighsStatus`] when `name` is not a known
+    /// `HighsInt`-typed info key.
+    pub fn int_info_value(&self, name: &CStr) -> Result<i64, HighsStatus> {
+        let value: &mut HighsInt = &mut -1;
+        let status =
+            unsafe { Highs_getIntInfoValue(self.highs.unsafe_mut_ptr(), name.as_ptr(), value) };
+        try_handle_status(status, "Highs_getIntInfoValue").map(|_| i64::from(*value))
+    }
+
+    /// Read a `double`-typed solution info value by name.
+    ///
+    /// `name` must be a key that HiGHS exposes as a `double`-typed info value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failing [`HighsStatus`] when `name` is not a known
+    /// `double`-typed info key.
+    pub fn double_info_value(&self, name: &CStr) -> Result<f64, HighsStatus> {
+        let value: &mut f64 = &mut -1.0;
+        let status =
+            unsafe { Highs_getDoubleInfoValue(self.highs.unsafe_mut_ptr(), name.as_ptr(), value) };
+        try_handle_status(status, "Highs_getDoubleInfoValue").map(|_| *value)
+    }
+
+    /// The number of simplex iterations performed for this solution
+    /// (`0` when the interior-point method was not used).
+    pub fn simplex_iteration_count(&self) -> i64 {
+        self.int_info_value(c"simplex_iteration_count")
+            .expect("simplex_iteration_count is a known HighsInt info key")
+    }
+
+    /// The number of interior-point (IPM) iterations performed for this solution
+    /// (`0` when the interior-point method was not used).
+    pub fn ipm_iteration_count(&self) -> i64 {
+        self.int_info_value(c"ipm_iteration_count")
+            .expect("ipm_iteration_count is a known HighsInt info key")
+    }
+
+    /// The number of QP solver iterations performed for this solution (`0` when
+    /// the model was not a quadratic program).
+    pub fn qp_iteration_count(&self) -> i64 {
+        self.int_info_value(c"qp_iteration_count")
+            .expect("qp_iteration_count is a known HighsInt info key")
+    }
+
+    /// The number of first-order (PDLP) iterations performed for this solution
+    /// (`0` when the PDLP solver was not used).
+    pub fn pdlp_iteration_count(&self) -> i64 {
+        self.int_info_value(c"pdlp_iteration_count")
+            .expect("pdlp_iteration_count is a known HighsInt info key")
+    }
+
+    /// The number of crossover iterations performed for this solution
+    /// (`0` when no crossover ran).
+    pub fn crossover_iteration_count(&self) -> i64 {
+        self.int_info_value(c"crossover_iteration_count")
+            .expect("crossover_iteration_count is a known HighsInt info key")
+    }
+
+    /// Number of variables
+    fn num_cols(&self) -> usize {
+        self.highs.num_cols().expect("invalid number of columns")
+    }
+
+    /// Number of constraints
+    fn num_rows(&self) -> usize {
+        self.highs.num_rows().expect("invalid number of rows")
+    }
+}
+
+/// Concrete values of the solution
+#[derive(Clone, Debug)]
+pub struct Solution {
+    colvalue: Vec<f64>,
+    coldual: Vec<f64>,
+    rowvalue: Vec<f64>,
+    rowdual: Vec<f64>,
+}
+
+impl Solution {
+    /// The optimal values for each variables (in the order they were added)
+    pub fn columns(&self) -> &[f64] {
+        &self.colvalue
+    }
+    /// The optimal values for each variables in the dual problem (in the order they were added)
+    pub fn dual_columns(&self) -> &[f64] {
+        &self.coldual
+    }
+    /// The value of the constraint functions
+    pub fn rows(&self) -> &[f64] {
+        &self.rowvalue
+    }
+    /// The value of the constraint functions in the dual problem
+    pub fn dual_rows(&self) -> &[f64] {
+        &self.rowdual
+    }
+}
+
+impl Index<Col> for Solution {
+    type Output = f64;
+    fn index(&self, col: Col) -> &f64 {
+        &self.colvalue[col.0]
+    }
+}
+
+fn try_handle_status(status: c_int, msg: &str) -> Result<HighsStatus, HighsStatus> {
+    let status_enum = HighsStatus::try_from(status)
+        .expect("HiGHS returned an unexpected status value. Please report it as a bug to https://github.com/rust-or/highs/issues");
+    match status_enum {
+        status @ HighsStatus::OK => Ok(status),
+        status @ HighsStatus::Warning => {
+            log::warn!("HiGHS emitted a warning: {msg}");
+            Ok(status)
+        }
+        error => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn test_coefs(coefs: [f64; 2]) {
+        // See: https://github.com/rust-or/highs/issues/5
+        let mut problem = RowProblem::new();
+        // Minimize x + y subject to x ≥ 0, y ≥ 0.
+        let x = problem.add_column(1., -1..);
+        let y = problem.add_column(1., 0..);
+        problem.add_row(..1, [x, y].iter().copied().zip(coefs)); // 1 ≥ x + c y.
+        let solution = problem.optimise(Sense::Minimise).solve().get_solution();
+        assert_eq!([-1., 0.], solution.columns());
+    }
+
+    #[test]
+    fn test_single_zero_coef() {
+        test_coefs([1.0, 0.0]);
+        test_coefs([0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_all_zero_coefs() {
+        test_coefs([0.0, 0.0])
+    }
+
+    #[test]
+    fn test_no_zero_coefs() {
+        test_coefs([1.0, 1.0])
+    }
+
+    #[test]
+    fn test_infeasible_empty_row() {
+        let mut problem = RowProblem::new();
+        let row_factors: &[(Col, f64)] = &[];
+        problem.add_row(2..3, row_factors);
+        let _ = problem.optimise(Sense::Minimise).try_solve();
+    }
+
+    #[test]
+    fn test_add_row_and_col() {
+        let mut model = Model::new::<Problem<ColMatrix>>(Problem::default());
+        let col = model.add_col(1., 1.0.., vec![]);
+        model.add_row(..1.0, vec![(col, 1.0)]);
+        let solved = model.solve();
+        assert_eq!(solved.status(), HighsModelStatus::Optimal);
+        let solution = solved.get_solution();
+        assert_eq!(solution.columns(), vec![1.0]);
+
+        let mut model = Model::from(solved);
+        let new_col = model.add_col(1., ..1.0, vec![]);
+        model.add_row(2.0.., vec![(new_col, 1.0)]);
+        let solved = model.solve();
+        assert_eq!(solved.status(), HighsModelStatus::Infeasible);
+    }
+
+    #[test]
+    fn test_initial_solution() {
+        use crate::status::HighsModelStatus::Optimal;
+        use crate::{Model, RowProblem, Sense};
+        let mut p = RowProblem::default();
+        p.add_column(1., 0..50);
+        let mut m = Model::new(p);
+        m.make_quiet();
+        m.set_sense(Sense::Maximise);
+        m.set_option("time_limit", 0);
+        m.set_solution(Some(&[50.0]), Some(&[]), Some(&[1.0]), Some(&[]));
+        let solved = m.solve();
+        assert_eq!(solved.status(), Optimal);
+        assert_eq!(solved.get_solution().columns(), &[50.0]);
+    }
+
+    #[test]
+    fn test_mip_gap() {
+        use crate::status::HighsModelStatus::Optimal;
+        use crate::{Model, RowProblem, Sense};
+        let mut p = RowProblem::default();
+        p.add_integer_column(1., 0..50);
+        let mut m = Model::new(p);
+        m.make_quiet();
+        m.set_sense(Sense::Maximise);
+        let solved = m.solve();
+        println!("{:?}", solved.get_solution());
+        assert_eq!(solved.status(), Optimal);
+        assert_eq!(solved.mip_gap(), 0.0);
+        assert_eq!(solved.get_solution().columns(), &[50.0]);
+    }
+
+    #[test]
+    fn test_inf_mip_gap() {
+        use crate::status::HighsModelStatus::Optimal;
+        use crate::{Model, RowProblem, Sense};
+        let mut p = RowProblem::default();
+        p.add_column(1., 0..50);
+        let mut m = Model::new(p);
+        m.make_quiet();
+        m.set_sense(Sense::Maximise);
+        let solved = m.solve();
+        println!("{:?}", solved.get_solution());
+        assert_eq!(solved.status(), Optimal);
+        assert_eq!(solved.mip_gap(), f64::INFINITY);
+        assert_eq!(solved.get_solution().columns(), &[50.0]);
+    }
+
+    #[test]
+    fn test_objective_value() {
+        use crate::status::HighsModelStatus::Optimal;
+        use crate::{Model, RowProblem, Sense};
+        let mut p = RowProblem::default();
+        p.add_column(1., 0..50);
+        let mut m = Model::new(p);
+        m.make_quiet();
+        m.set_sense(Sense::Maximise);
+        let solved = m.solve();
+        assert_eq!(solved.status(), Optimal);
+        assert_eq!(solved.objective_value(), 50.0);
+    }
+
+    #[test]
+    fn test_objective_value_empty_model() {
+        use crate::{Model, RowProblem};
+        let m = Model::new(RowProblem::default());
+        let solved = m.solve();
+        assert_eq!(solved.objective_value(), 0.0);
+    }
+
+    #[test]
+    fn test_adding_integer_column() {
+        let mut model = RowProblem::new().optimise(Sense::Minimise);
+        let a = model.add_integer_column(1., 0..1, []);
+        let b = model.add_integer_column(1., 0..1, []);
+        model.add_row(1.5.., [(a, 1.), (b, 1.)]);
+        let solved = model.solve();
+        assert_eq!(solved.objective_value(), 2.0);
+    }
+
+    #[test]
+    fn test_problem_change_column_cost() {
+        let mut problem = RowProblem::new();
+        let x = problem.add_column(1., 1..);
+        let solved = problem.clone().optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 1.0);
+        problem.change_column_cost(x, 2.);
+        let solved = problem.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 2.0);
+    }
+
+    #[test]
+    fn test_model_change_column_cost() {
+        let mut problem = RowProblem::new();
+        let x = problem.add_column(1., 1..);
+        let solved = problem.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 1.0);
+        let mut model: crate::Model = solved.into();
+        model.change_column_cost(x, 2.);
+        let solved = model.solve();
+        assert_eq!(solved.objective_value(), 2.0);
+    }
+
+    #[test]
+    fn test_num_cols_and_rows() {
+        let mut problem = RowProblem::new();
+        let x = problem.add_column(1., -1..);
+        let y = problem.add_column(1., 0..);
+        problem.add_row(..1, [(x, 1.), (y, 1.)]);
+        let model = problem.optimise(Sense::Minimise);
+        assert_eq!(model.num_cols(), 2);
+        assert_eq!(model.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_problem_change_column_bounds() {
+        let mut problem = RowProblem::new();
+        let x = problem.add_column(1., 0..);
+        let solved = problem.clone().optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 0.0);
+        problem.change_column_bounds(x, 1..);
+        let solved = problem.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 1.0);
+    }
+
+    #[test]
+    fn test_model_change_column_bounds() {
+        let mut problem = RowProblem::new();
+        let x = problem.add_column(1., 0..);
+        let solved = problem.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.objective_value(), 0.0);
+        let mut model: crate::Model = solved.into();
+        model.change_column_bounds(x, 1..);
+        let solved = model.solve();
+        assert_eq!(solved.objective_value(), 1.0);
+    }
+
+    #[test]
+    fn test_set_threads() {
+        // Verify that the option is accepted by the solver by reading it back
+        // via the raw C API after setting it.
+        use std::num::NonZeroU32;
+        let mut model = Model::new(RowProblem::default());
+        model.set_threads(NonZeroU32::new(2).unwrap());
+        let mut value: i32 = 0;
+        let option = std::ffi::CString::new("threads").unwrap();
+        let status = unsafe {
+            highs_sys::Highs_getIntOptionValue(model.as_mut_ptr(), option.as_ptr(), &mut value)
+        };
+        assert_eq!(status, highs_sys::STATUS_OK);
+        assert_eq!(value, 2);
+    }
+
+    #[test]
+    fn test_pass_hessian_convex_qp() {
+        use crate::status::HighsModelStatus::Optimal;
+        // min x^2 + y^2  s.t.  x + y = 1,  x, y in [-10, 10]. Optimum at (0.5, 0.5).
+        let mut pb = RowProblem::new();
+        let x = pb.add_column(0., -10.0..=10.0);
+        let y = pb.add_column(0., -10.0..=10.0);
+        pb.add_row(1.0..=1.0, [(x, 1.), (y, 1.)]);
+        let mut model = pb.optimise(Sense::Minimise);
+        model.make_quiet();
+        // Q = diag(2, 2) for the 0.5 x'Qx convention: one column per variable.
+        model
+            .try_pass_hessian(HessianFormat::Triangular, [[(0, 2.0)], [(1, 2.0)]])
+            .unwrap();
+        let solved = model.solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 0.5).abs() < 1e-6, "x = {}", cols[0]);
+        assert!((cols[1] - 0.5).abs() < 1e-6, "y = {}", cols[1]);
+        assert!((solved.objective_value() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_pass_hessian_index_overflow_is_error() {
+        let mut model = RowProblem::default().optimise(Sense::Minimise);
+        let err = model.try_pass_hessian(
+            HessianFormat::Triangular,
+            [vec![(0usize, 2.0)], vec![(usize::MAX, 2.0)]],
+        );
+        assert!(matches!(err, Err(HessianError::IndexTooLarge { entry: 1 })));
+    }
+
+    #[test]
+    fn test_pass_hessian_accepts_lazy_iterators() {
+        use crate::status::HighsModelStatus::Optimal;
+        let mut pb = RowProblem::new();
+        let x = pb.add_column(0., -10.0..=10.0);
+        let y = pb.add_column(0., -10.0..=10.0);
+        pb.add_row(1.0..=1.0, [(x, 1.), (y, 1.)]);
+        let mut model = pb.optimise(Sense::Minimise);
+        model.make_quiet();
+        model
+            .try_pass_hessian(
+                HessianFormat::Triangular,
+                (0..2).map(|j| std::iter::once((j, 2.0))),
+            )
+            .unwrap();
+        let solved = model.solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 0.5).abs() < 1e-6, "x = {}", cols[0]);
+        assert!((cols[1] - 0.5).abs() < 1e-6, "y = {}", cols[1]);
+    }
+
+    #[test]
+    fn test_semi_continuous_column() {
+        use crate::status::HighsModelStatus::Optimal;
+        // min x  s.t.  x >= 3,  x in {0} U [5, 10].
+        let mut pb = RowProblem::new();
+        let x = pb.add_semi_continuous_column(1., 5.0..=10.0);
+        pb.add_row(3.., [(x, 1.)]);
+        let solved = pb.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 5.0).abs() < 1e-6, "x = {}", cols[0]);
+    }
+
+    #[test]
+    fn test_semi_continuous_column_off() {
+        use crate::status::HighsModelStatus::Optimal;
+        // min x with x in {0} U [5, 10] and nothing forcing it on => x = 0.
+        let mut pb = RowProblem::new();
+        let _x = pb.add_semi_continuous_column(1., 5.0..=10.0);
+        let solved = pb.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.status(), Optimal);
+        assert!(
+            solved.objective_value().abs() < 1e-9,
+            "obj = {}",
+            solved.objective_value()
+        );
+    }
+
+    #[test]
+    fn test_semi_integer_column() {
+        use crate::status::HighsModelStatus::Optimal;
+        // max x  s.t.  x <= 7.5,  x in {0} U {5, 6, ..., 10}.
+        let mut pb = RowProblem::new();
+        let x = pb.add_semi_integer_column(1., 5.0..=10.0);
+        pb.add_row(..=7.5, [(x, 1.)]);
+        let solved = pb.optimise(Sense::Maximise).solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 7.0).abs() < 1e-6, "x = {}", cols[0]);
+    }
+
+    #[test]
+    fn test_semi_continuous_col_problem() {
+        use crate::status::HighsModelStatus::Optimal;
+        let mut pb = ColProblem::new();
+        let c = pb.add_row(3..); // x >= 3
+        pb.add_semi_continuous_column(1., 5.0..=10.0, [(c, 1.)]);
+        let solved = pb.optimise(Sense::Minimise).solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 5.0).abs() < 1e-6, "x = {}", cols[0]);
+    }
+
+    #[test]
+    fn test_semi_integer_col_incremental() {
+        use crate::status::HighsModelStatus::Optimal;
+        let mut model = ColProblem::new().optimise(Sense::Maximise);
+        let x = model.add_semi_integer_column(1., 5.0..=10.0, vec![]);
+        model.add_row(..=7.5, [(x, 1.)]);
+        let solved = model.solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 7.0).abs() < 1e-6, "x = {}", cols[0]);
+    }
+
+    #[test]
+    fn test_try_add_semi_continuous_column() {
+        use crate::status::HighsModelStatus::Optimal;
+        let mut model = ColProblem::new().optimise(Sense::Minimise);
+        let x = model
+            .try_add_semi_continuous_column(1., 5.0..=10.0, vec![])
+            .expect("add semi-continuous column");
+        model.add_row(3.., [(x, 1.)]);
+        let solved = model.solve();
+        assert_eq!(solved.status(), Optimal);
+        let cols = solved.get_solution().columns().to_vec();
+        assert!((cols[0] - 5.0).abs() < 1e-6, "x = {}", cols[0]);
+    }
+}

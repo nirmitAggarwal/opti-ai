@@ -1,0 +1,10 @@
+[package]
+name = "opti-bakery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+good_lp.workspace = true
+opti-domain = { path = "../domain" }
+thiserror.workspace = true

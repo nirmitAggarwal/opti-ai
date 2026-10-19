@@ -1,0 +1,10 @@
+[package]
+name = "opti-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opti-bakery = { path = "../../crates/bakery" }
+opti-domain = { path = "../../crates/domain" }
+serde_json.workspace = true

@@ -1,0 +1,50 @@
+{
+  "bakery_name": "Sunrise Bakery",
+  "horizon_days": 1,
+  "products": [
+    {
+      "id": "croissant",
+      "name": "croissants",
+      "unit": "piece",
+      "price_cents": 350,
+      "unit_cost_cents": 140,
+      "demand_limit": 100,
+      "recipe": [
+        { "resource_id": "flour", "quantity_per_unit": 80, "unit": "g" },
+        { "resource_id": "sugar", "quantity_per_unit": 15, "unit": "g" },
+        { "resource_id": "oven_minutes", "quantity_per_unit": 2, "unit": "minute" }
+      ]
+    },
+    {
+      "id": "bread",
+      "name": "loaves of bread",
+      "unit": "loaf",
+      "price_cents": 280,
+      "unit_cost_cents": 90,
+      "demand_limit": 80,
+      "recipe": [
+        { "resource_id": "flour", "quantity_per_unit": 300, "unit": "g" },
+        { "resource_id": "sugar", "quantity_per_unit": 5, "unit": "g" },
+        { "resource_id": "oven_minutes", "quantity_per_unit": 4, "unit": "minute" }
+      ]
+    },
+    {
+      "id": "cake",
+      "name": "cakes",
+      "unit": "cake",
+      "price_cents": 900,
+      "unit_cost_cents": 400,
+      "demand_limit": 40,
+      "recipe": [
+        { "resource_id": "flour", "quantity_per_unit": 500, "unit": "g" },
+        { "resource_id": "sugar", "quantity_per_unit": 200, "unit": "g" },
+        { "resource_id": "oven_minutes", "quantity_per_unit": 15, "unit": "minute" }
+      ]
+    }
+  ],
+  "resources": [
+    { "id": "flour", "name": "flour", "unit": "g", "available_quantity": 12000 },
+    { "id": "sugar", "name": "sugar", "unit": "g", "available_quantity": 5000 },
+    { "id": "oven_minutes", "name": "oven time", "unit": "minute", "available_quantity": 900 }
+  ]
+}
