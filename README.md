@@ -17,7 +17,8 @@ The current implementation provides:
 - Integer production decisions bounded by demand.
 - HiGHS-backed LP/MILP solving through `good_lp`.
 - Deterministic resource usage and bottleneck reporting.
-- A deterministic explanation fallback; no AI or network is required.
+- A deterministic decision brief with product contributions, resource evidence,
+  remaining capacity, and plain-language caveats; no AI or network is required.
 - A CLI that solves the built-in example or a JSON plan.
 - Offline unit tests and a reproducible Rust toolchain pin.
 
@@ -54,7 +55,9 @@ cargo run --offline -p opti-cli -- validate fixtures/bakery.json
 ```
 
 The example recommends 100 croissants and 8 cakes. Flour is the limiting
-resource and the estimated contribution profit is `$250.00`.
+resource, with 0 g remaining, and the estimated contribution profit is
+`$250.00`. The output also explains that this is the best result for the
+approved inputs—not a guarantee—and excludes fixed operating costs.
 
 ## Checks
 

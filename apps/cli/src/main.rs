@@ -1,4 +1,4 @@
-use opti_bakery::{SolveResult, explain_result, format_cents, solve_plan};
+use opti_bakery::{SolveResult, explain_result, format_cents, format_quantity, solve_plan};
 use opti_domain::BakeryPlan;
 use std::{env, fs, path::Path, process::ExitCode};
 
@@ -75,16 +75,17 @@ fn print_result(result: &SolveResult) {
             ""
         };
         println!(
-            "  {:<20} {:>5} / {:<5} {}{}",
+            "  {:<20} used {:>5} / {:<5} {} | remaining {:>5}{}",
             resource.resource_name,
-            resource.used_quantity,
-            resource.available_quantity,
+            format_quantity(resource.used_quantity),
+            format_quantity(resource.available_quantity),
             resource.unit,
+            format_quantity(resource.remaining_quantity),
             marker
         );
     }
     println!();
-    println!("Explanation:");
+    println!("Decision brief:");
     println!("{}", explain_result(result));
 }
 

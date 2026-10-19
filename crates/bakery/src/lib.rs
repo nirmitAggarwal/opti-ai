@@ -168,7 +168,20 @@ pub fn explain_result(result: &SolveResult) -> String {
         .decisions
         .iter()
         .filter(|decision| decision.units > 0)
-        .map(|decision| format!("{} {}", decision.units, decision.product_name))
+        .map(|decision| {
+            format!(
+                "{} {} ({})",
+                format_quantity(decision.units),
+                decision.product_name,
+                format_cents(decision.profit_cents)
+            )
+        })
+        .collect::<Vec<_>>();
+    let not_recommended = result
+        .decisions
+        .iter()
+        .filter(|decision| decision.units == 0)
+        .map(|decision| decision.product_name.as_str())
         .collect::<Vec<_>>();
     let bottlenecks = result
         .resources
@@ -176,11 +189,39 @@ pub fn explain_result(result: &SolveResult) -> String {
         .filter(|resource| resource.is_bottleneck)
         .map(|resource| resource.resource_name.as_str())
         .collect::<Vec<_>>();
+    let resource_facts = result
+        .resources
+        .iter()
+        .map(|resource| {
+            let bottleneck_note = if resource.is_bottleneck {
+                " (limiting)"
+            } else {
+                ""
+            };
+            format!(
+                "{}: {} used of {} {}; {} remaining{}",
+                resource.resource_name,
+                format_quantity(resource.used_quantity),
+                format_quantity(resource.available_quantity),
+                resource.unit,
+                format_quantity(resource.remaining_quantity),
+                bottleneck_note
+            )
+        })
+        .collect::<Vec<_>>();
 
     let production_summary = if production.is_empty() {
         "no products".to_owned()
     } else {
         production.join(", ")
+    };
+    let not_recommended_summary = if not_recommended.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " No units are recommended for {}.",
+            not_recommended.join(", ")
+        )
     };
     let bottleneck_summary = if bottlenecks.is_empty() {
         "No resource is fully consumed under this plan.".to_owned()
@@ -189,10 +230,12 @@ pub fn explain_result(result: &SolveResult) -> String {
     };
 
     format!(
-        "For {}, produce {}. Estimated contribution profit is {}. {}",
+        "Decision: For {}, the best feasible plan under the listed demand, recipe, price, cost, and capacity limits is to produce {}. Estimated contribution profit is {} (sales minus unit costs; fixed operating costs are not included).{}\n\nWhy this plan: The amount in parentheses beside each recommended product is its total contribution to the result.\n\nResource check: {}. {}\n\nImportant: This is the best result for the approved model inputs, not a guarantee of business results. Review demand, prices, costs, recipes, and available capacity before acting.",
         result.bakery_name,
         production_summary,
         format_cents(result.objective_profit_cents),
+        not_recommended_summary,
+        resource_facts.join("; "),
         bottleneck_summary
     )
 }
@@ -201,6 +244,24 @@ pub fn format_cents(cents: i64) -> String {
     let sign = if cents < 0 { "-" } else { "" };
     let absolute = cents.unsigned_abs();
     format!("{sign}${}.{:02}", absolute / 100, absolute % 100)
+}
+
+pub fn format_quantity(quantity: u64) -> String {
+    let digits = quantity.to_string();
+    let first_group_length = digits.len() % 3;
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0
+            && (index == first_group_length
+                || (index > first_group_length && (index - first_group_length) % 3 == 0))
+        {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+
+    formatted
 }
 
 /// Small, deterministic fixture used by the CLI and integration tests.
@@ -340,13 +401,37 @@ mod tests {
 
         assert!(explanation.contains("100 croissants"));
         assert!(explanation.contains("8 cakes"));
+        assert!(explanation.contains("$210.00"));
         assert!(explanation.contains("$250.00"));
-        assert!(explanation.contains("flour"));
+        assert!(explanation.contains("flour: 12,000 used of 12,000 g; 0 remaining (limiting)"));
+        assert!(explanation.contains("The limiting resource(s) are flour."));
+        assert!(explanation.contains("No units are recommended for loaves of bread."));
+    }
+
+    #[test]
+    fn explanation_identifies_when_no_resource_is_fully_consumed() {
+        let mut plan = demo_plan();
+        for resource in &mut plan.resources {
+            resource.available_quantity += 1;
+        }
+
+        let result = solve_plan(&plan).expect("plan should solve");
+        let explanation = explain_result(&result);
+
+        assert!(explanation.contains("No resource is fully consumed under this plan."));
+        assert!(!explanation.contains("(limiting)"));
     }
 
     #[test]
     fn formats_negative_cents() {
         assert_eq!(format_cents(-5), "-$0.05");
         assert_eq!(format_cents(1_234), "$12.34");
+    }
+
+    #[test]
+    fn formats_quantities_with_thousands_separators() {
+        assert_eq!(format_quantity(0), "0");
+        assert_eq!(format_quantity(12_000), "12,000");
+        assert_eq!(format_quantity(1_234_567), "1,234,567");
     }
 }
